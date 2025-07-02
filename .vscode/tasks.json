@@ -9,11 +9,42 @@
       "problemMatcher": []
     },
     {
+      "label": "Run Go Backend (Auto-reload)",
+      "type": "shell",
+      "command": "./run_go_dev.sh",
+      "group": "build",
+      "problemMatcher": [],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      }
+    },
+    {
       "label": "Run Python RAG Agent",
       "type": "shell",
       "command": "python3 rag_agent.py",
       "group": "build",
       "problemMatcher": []
+    },
+    {
+      "label": "Run Python RAG Agent (Auto-reload)",
+      "type": "shell",
+      "command": "uvicorn",
+      "args": ["rag_agent:app", "--host", "0.0.0.0", "--port", "8000", "--reload"],
+      "group": "build",
+      "problemMatcher": [],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      }
+    },
+    {
+      "label": "Run Python RAG Agent (Dev Mode)",
+      "type": "shell",
+      "command": "python3 run_dev.py",
+      "group": "build",
+      "problemMatcher": [],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      }
     }
   ]
 }

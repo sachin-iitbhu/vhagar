@@ -4,17 +4,18 @@
 
 from fastapi import FastAPI  # Web framework for building APIs
 from pydantic import BaseModel  # For data validation and request/response models
-from langchain_openai import OpenAIEmbeddings  # For generating embeddings using OpenAI
-from langchain_community.vectorstores import Chroma  # Vector database for storing embeddings
-from langchain_community.chat_models import ChatOpenAI  # Chat LLM interface
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI  # For generating embeddings and chat LLM interface
+from langchain_chroma import Chroma  # Vector database for storing embeddings
 from langchain.chains import RetrievalQA  # Retrieval-augmented QA chain
 from langchain.text_splitter import RecursiveCharacterTextSplitter  # For splitting documents into chunks
 from langchain.docstore.document import Document  # Document wrapper for LangChain
 from langchain_core.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate  # For prompt engineering
-from typing import List, Dict, Optional
 import json  # For loading JSON data
 import os  # For environment variables
-import re  # For extracting structured data from content
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Set your OpenAI API key (for demo only; use environment variables in production)
 os.environ["OPENAI_API_KEY"] = "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"
@@ -22,23 +23,44 @@ os.environ["OPENAI_API_KEY"] = "sk-proj-K96fYLS7bKuw423YoMm8xam4fwoYQTnmJNvmVSpL
 # Initialize FastAPI app
 app = FastAPI()
 
+logging.info("FastAPI app initialized.")
+
 # Define request and response data models for the API
 class QueryRequest(BaseModel):
     query: str  # The user's question
 
+class CompensationCard(BaseModel):
+    id: str
+    company: str
+    title: str
+    total_compensation: str
+    total_compensation_currency: str = ""
+    base_salary: str
+    base_salary_currency: str = ""
+    equity: str
+    equity_currency: str = ""
+    bonus: str = ""
+    bonus_currency: str = ""
+    experience: str
+    location: str
+    url: str
+    created_at: str
+
 class AgentResponse(BaseModel):
     response: str  # The agent's answer
-    compensation_data: Optional[List[Dict]] = None  # Structured compensation data for the frontend
+    compensation_data: list[CompensationCard] = []  # Structured compensation data
+    source_links: list[str] = []  # LeetCode discussion links for grounding
 
 # Ensure the OpenAI API key is set
 if not os.environ.get("OPENAI_API_KEY"):
     raise RuntimeError("OPENAI_API_KEY environment variable not set. Please set it before running the agent.")
 
 # Load scraped LeetCode compensation data from JSON file
+logging.info("Loading LeetCode compensation data...")
 with open("leetcode_compensation_data.json", "r", encoding='utf-8') as f:
     data = json.load(f)
 
-print(f"Loaded {len(data)} compensation posts from LeetCode")
+logging.info(f"Loaded {len(data)} compensation posts from LeetCode")
 
 # Convert each LeetCode compensation post to a text document for retrieval
 raw_docs = []
@@ -56,10 +78,13 @@ for entry in data:
     )
     raw_docs.append(Document(page_content=doc_text))
 
+logging.info(f"Created {len(raw_docs)} documents for retrieval.")
+
 # Split documents into smaller chunks for better retrieval
 # Using larger chunks since LeetCode posts contain more detailed information
 splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
 chunks = splitter.split_documents(raw_docs)
+logging.info(f"Split documents into {len(chunks)} chunks.")
 
 # Create embeddings for each chunk using OpenAI
 embedding = OpenAIEmbeddings()
@@ -67,30 +92,48 @@ embedding = OpenAIEmbeddings()
 # Store embeddings in a Chroma vector database (persistent)
 PERSIST_DIR = "chroma_db"
 if not os.path.exists(PERSIST_DIR):
+    logging.info(f"Creating new vectorstore in {PERSIST_DIR}...")
     # First run: create and persist the vectorstore
     vectorstore = Chroma.from_documents(chunks, embedding, persist_directory=PERSIST_DIR)
+    logging.info("Vectorstore created and persisted.")
 else:
+    logging.info(f"Loading persistent vectorstore from {PERSIST_DIR}...")
     # Load the persistent vectorstore
     vectorstore = Chroma(embedding_function=embedding, persist_directory=PERSIST_DIR)
+    logging.info("Vectorstore loaded.")
 
 # Create a retriever to fetch relevant chunks for a query
 # Increased k to get more context from the larger dataset
 retriever = vectorstore.as_retriever(search_kwargs={"k": 8})
+logging.info("Retriever created.")
 
-# System prompt to instruct the LLM to only answer job/compensation-related queries
+# System prompt to instruct the LLM to return a JSON object containing a summary and a JSON array of compensation objects.
 system_instruction = (
     "You are a helpful assistant for job switchers and professionals seeking compensation information. "
     "You have access to real LeetCode compensation data from various companies and roles. "
     "Only answer questions related to compensation, salaries, job roles, companies, or career advice. "
-    "When providing compensation information, be specific about the source being LeetCode discussion posts. "
-    "If the question is unrelated to compensation or careers, politely respond: "
-    "'I can only help with compensation, job roles, or company-related queries based on LeetCode data.'"
+    "If the question is unrelated to compensation or careers, politely respond with a JSON object containing an error message. "
+    "\n\n"
+    "Your response must be a single JSON object with two keys: 'summary' and 'compensation_cards'. "
+    "The 'summary' key should contain a concise, natural-language summary of the compensation trends based on the user's query and the retrieved data. "
+    "The 'compensation_cards' key must contain a JSON array of objects, where each object represents a relevant LeetCode post and follows this schema: "
+    "id, company, title, total_compensation, total_compensation_currency, base_salary, base_salary_currency, equity, equity_currency, bonus, bonus_currency, experience, location, url, created_at. "
+    "For all currency fields, always use a valid ISO 4217 currency code (e.g., 'INR', 'USD', 'EUR', 'GBP', etc.). Do not use non-standard codes like 'LPA INR'. "
+    "If the compensation is mentioned in units like 'LPA', 'lakhs', or 'crores', convert them to the full numeric value in the appropriate currency (e.g., '35 LPA INR' should be '3500000' with currency 'INR'). "
+    "If a field is not mentioned in a post, use 'Not specified' or an empty string. "
+    "Example output:"
+    '{{'
+    '  "summary": "For a Software Engineer in London, the average total compensation is around $120,000, with base salaries ranging from $90,000 to $110,000. Tech giants like Google and Meta tend to offer higher equity components.",'
+    '  "compensation_cards": [{{"id": "123", "company": "Amazon", "title": "SDE1", "total_compensation": "150000", "total_compensation_currency": "USD", "base_salary": "120000", "base_salary_currency": "USD", "equity": "20000", "equity_currency": "USD", "bonus": "10000", "bonus_currency": "USD", "experience": "2 years", "location": "Seattle", "url": "https://leetcode.com/discuss/post/123", "created_at": "2024-01-01"}}]'
+    '}}'
+    "\nReturn only the JSON object and nothing else. "
+    "Be precise and extract each component and its currency individually from the post content. "
 )
 
 # Build a prompt template for the LLM (must include {context} and {question})
 prompt = ChatPromptTemplate.from_messages([
     SystemMessagePromptTemplate.from_template(system_instruction),
-    HumanMessagePromptTemplate.from_template("Context: {context}\nQuestion: {question}")
+    HumanMessagePromptTemplate.from_template("Context:\n{context}\n\nQuestion:\n{question}")
 ])
 
 # Initialize the LLM (GPT-4) and the RetrievalQA chain
@@ -98,114 +141,74 @@ llm = ChatOpenAI(model_name="gpt-4", temperature=0)
 qa_chain = RetrievalQA.from_chain_type(
     llm=llm,
     retriever=retriever,
-    return_source_documents=False,
+    return_source_documents=True,  # Changed to True to get source documents
     chain_type_kwargs={"prompt": prompt}
 )
 
-# Define the API endpoint for querying the agent
+# Remove extract_compensation_data and update /query endpoint to only use LLM JSON output
+
 @app.post("/query")
 async def query_endpoint(req: QueryRequest):
-    # Pass the user's query to the RetrievalQA chain and return the answer
-    answer = qa_chain.run(req.query)
-    
-    # Check if the query is asking for compensation data that should include structured results
-    query_lower = req.query.lower()
-    should_include_data = any(keyword in query_lower for keyword in [
-        'show', 'find', 'search', 'get', 'list', 'data', 'compensation', 'salary', 'offer'
-    ])
-    
-    compensation_data = None
-    if should_include_data:
-        # Get the source documents used for this query
-        # Retrieve relevant documents for structuring
-        docs = retriever.get_relevant_documents(req.query)
-        
-        # Extract structured data from the original dataset based on the query
-        relevant_entries = []
-        for doc in docs:
-            # Find matching entries in our original data
-            for entry in data:
-                if entry['title'] in doc.page_content or entry['topic_id'] in doc.page_content:
-                    relevant_entries.append(entry)
-        
-        if relevant_entries:
-            compensation_data = extract_compensation_data(answer, relevant_entries)
-    
-    return AgentResponse(response=answer, compensation_data=compensation_data)
+    logging.info(f"Received query: {req.query}")
+    try:
+        logging.info("Invoking QA chain...")
+        result = qa_chain.invoke({"query": req.query})
+        answer = result["result"]
+        source_docs = result.get("source_documents", [])
+        logging.info(f"QA chain returned {len(source_docs)} source documents.")
 
-def extract_compensation_data(content: str, original_data: List[Dict]) -> List[Dict]:
-    """
-    Extract and structure compensation data from LeetCode posts
-    Returns data in format expected by Chat.tsx
-    """
-    structured_data = []
-    
-    # Try to extract structured compensation information from the content
-    for entry in original_data:
-        # Look for compensation-related keywords in title or content
-        title = entry.get('title', '').lower()
-        content_text = entry.get('content', '').lower()
+        import json
+        import re
         
-        if not any(keyword in title + content_text for keyword in ['salary', 'compensation', 'offer', 'tc', 'total comp']):
-            continue
-            
-        # Extract company name from title
-        company = 'Unknown'
-        common_companies = ['google', 'meta', 'facebook', 'amazon', 'microsoft', 'apple', 'netflix', 'uber', 'airbnb', 'salesforce']
-        for comp in common_companies:
-            if comp in title:
-                company = comp.capitalize()
-                if comp == 'facebook':
-                    company = 'Meta'
-                break
+        summary = "Could not retrieve a summary."
+        compensation_cards = []
+        source_links = []
         
-        # Try to extract numbers (salary, total comp, etc.)
-        numbers = re.findall(r'\$?(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)[k]?', entry.get('content', ''))
-        salary_numbers = [int(n.replace(',', '')) for n in numbers if len(n.replace(',', '')) >= 4]
-        
-        # Extract level information
-        level = 'Unknown'
-        level_patterns = [r'l(\d+)', r'level\s*(\d+)', r'e(\d+)', r'sde\s*(\d+)', r'ic(\d+)']
-        for pattern in level_patterns:
-            match = re.search(pattern, title + content_text)
-            if match:
-                level_num = match.group(1)
-                if 'sde' in title + content_text:
-                    level = f'SDE {level_num}'
-                elif company.lower() == 'google':
-                    level = f'L{level_num}'
-                elif company.lower() == 'meta':
-                    level = f'E{level_num}'
-                else:
-                    level = f'L{level_num}'
-                break
-        
-        # Estimate compensation based on extracted numbers
-        total_comp = max(salary_numbers) if salary_numbers else 0
-        base_salary = min(salary_numbers) if len(salary_numbers) > 1 else int(total_comp * 0.6) if total_comp else 0
-        
-        structured_entry = {
-            'id': entry.get('topic_id', str(len(structured_data))),
-            'company': company,
-            'level': level,
-            'totalCompensation': total_comp,
-            'baseSalary': base_salary,
-            'bonus': int(total_comp * 0.1) if total_comp else 0,
-            'equity': total_comp - base_salary - int(total_comp * 0.1) if total_comp else 0,
-            'location': 'Location not specified',
-            'yearsOfExperience': 'Not specified',
-            'submittedDate': entry.get('created_at', ''),
-            'url': entry.get('url', ''),
-            'originalTitle': entry.get('title', '')
-        }
-        
-        # Only add if we have meaningful data
-        if total_comp > 0 or company != 'Unknown':
-            structured_data.append(structured_entry)
-    
-    return structured_data[:10]  # Limit to 10 results for UI performance
+        try:
+            # The entire LLM response should be a JSON object.
+            # First, find the JSON object in the response.
+            json_match = re.search(r'\{.*\}', answer, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(0)
+                logging.info(f"Attempting to parse JSON from LLM output: {json_str[:300]}...")
+                
+                parsed_json = json.loads(json_str)
+                summary = parsed_json.get("summary", summary)
+                cards_data = parsed_json.get("compensation_cards", [])
+                
+                for card in cards_data:
+                    compensation_cards.append(CompensationCard(**card))
+                
+                source_links = [card.get("url", "") for card in cards_data if card.get("url")]
+                logging.info(f"Successfully parsed summary and {len(compensation_cards)} compensation cards.")
+            else:
+                logging.warning(f"No JSON object found in LLM output: {answer}")
+                summary = answer # Fallback to returning the raw answer if parsing fails
+        except Exception as e:
+            logging.error(f"Failed to parse LLM output as JSON: {answer}", exc_info=True)
+            summary = answer # Fallback for safety
+            compensation_cards = []
+            source_links = []
+
+        response = AgentResponse(
+            response=summary,
+            compensation_data=compensation_cards,
+            source_links=source_links[:10]
+        )
+        logging.info(f"Returning response with {len(compensation_cards)} cards and {len(source_links)} links.")
+        return response
+    except Exception as e:
+        logging.error(f"An unexpected error occurred in /query endpoint for query: '{req.query}'", exc_info=True)
+        # Re-raise the exception to be handled by FastAPI's default error handling
+        raise
 
 # Run the FastAPI app with Uvicorn if this script is executed directly
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(
+        "rag_agent:app",  # Use module:app format for reload
+        host="0.0.0.0", 
+        port=8000,
+        reload=True,  # Enable auto-reload
+        reload_dirs=["."]  # Watch current directory for changes
+    )
