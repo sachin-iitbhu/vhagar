@@ -18,7 +18,7 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Set your OpenAI API key (for demo only; use environment variables in production)
-os.environ["OPENAI_API_KEY"] = "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"
+os.environ["OPENAI_API_KEY"] = ""
 
 # Initialize FastAPI app
 app = FastAPI()
